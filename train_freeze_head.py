@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 # def train(task_ids, model):
-def train(task_ids, model, first_task,to_freeze):
+def train(task_ids, model, first_task):
 
     tasks = [args.tasks[task_id] for task_id in task_ids]
 
@@ -68,7 +68,7 @@ def train(task_ids, model, first_task,to_freeze):
                 config_path = os.path.join(model_dir,CONFIG_NAME)
                 model_config = CONFIG_CLASS.from_json_file(config_path)
                 model = MODEL_CLASS(model_config).cuda()
-                state_dict = torch.load(model_path)
+                state_dict = torch.load(model_path )
                 model.load_state_dict(state_dict)
                 if not args.fp32:
                     model = FP16_Module(model)
@@ -108,7 +108,39 @@ def train(task_ids, model, first_task,to_freeze):
 
     param_optimizer = list(model.named_parameters())
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+    
+    if task_ids[0] == 1:
+        to_freeze = ((0,[11]),(1,[9]),(2,[1]),(3,[0,4]),(4,[11]),(5,[0,1]),(6,[9,10]),(7,[2]),(11,[0]))
+        attr = '.module.transformer'
+        while(True):
+            try:
+                exec(f'model{attr}')
+                break
+            except:
+                attr = '.module'+attr
 
+        for layer,head_indices in to_freeze:
+            layer_to_freeze = f'model{attr}.h[{str(layer)}].attn.c_attn'
+            exec(f'freeze_attention_head({layer_to_freeze},{head_indices})')
+            
+    elif task_ids[0] == 2:
+#         to_freeze = ((0,[11]),(1,[9]),(2,[1]),(3,[0,4]),(4,[11]),(5,[0,1]),(6,[9,10]),(7,[2]),(11,[0]))
+        # From BOOLQ freeze heads 19Dec2020
+        to_freeze = (0, [5, 11]), (1, [2]), (2, [4,7,11]), (3, [0]), (4, [11]), (5, [1]), (6, [9]),  (7,[2]), (11, [11]),  
+        attr = '.module.transformer'
+        while(True):
+            try:
+                exec(f'model{attr}')
+                break
+            except:
+                attr = '.module'+attr
+
+        for layer,head_indices in to_freeze:
+            layer_to_freeze = f'model{attr}.h[{str(layer)}].attn.c_attn'
+            exec(f'freeze_attention_head({layer_to_freeze},{head_indices})')     
+        
+    if not args.fp32:  # again because resize_token_embeddings makes embedding layer fp32
+        model = FP16_Module(model)
     optimizer_grouped_parameters = [
         {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
         {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
@@ -202,16 +234,21 @@ if __name__ == '__main__':
     init_logging(os.path.join(args.model_dir_root, 'log_train.txt'))
     logger.info('args = {}'.format(str(args)))
 
-    model = None
+    model=None
+    
+    global TOKENS_WEIGHT
+    if len(TOKENIZER) != TOKENS_WEIGHT.shape[0]:
+        TOKENS_WEIGHT = torch.cat((TOKENS_WEIGHT, torch.ones([1]).cuda()))
+
     if args.seq_train_type == "multitask":
         model = train(list(range(len(args.tasks))), model)
     else:
         if args.unbound:
             TASK_DICT = lll_unbound_setting(split_size=args.unbound)
         first_task = True
-        to_freeze = ((2,[0,2,3,4,5,7,8,9,11]),(3,[2,3,8]))
+        
         for task_id in range(len(args.tasks)):
 #             model = train([task_id], model)
-            model = train([task_id], model,first_task,to_freeze)
+            model = train([task_id], model,first_task)
 
             first_task = False

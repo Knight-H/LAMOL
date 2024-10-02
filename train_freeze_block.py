@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 # def train(task_ids, model):
-def train(task_ids, model, first_task,to_freeze):
+def train(task_ids, model, first_task):
 
     tasks = [args.tasks[task_id] for task_id in task_ids]
 
@@ -68,7 +68,7 @@ def train(task_ids, model, first_task,to_freeze):
                 config_path = os.path.join(model_dir,CONFIG_NAME)
                 model_config = CONFIG_CLASS.from_json_file(config_path)
                 model = MODEL_CLASS(model_config).cuda()
-                state_dict = torch.load(model_path)
+                state_dict = torch.load(model_path, map_location='cuda:1')
                 model.load_state_dict(state_dict)
                 if not args.fp32:
                     model = FP16_Module(model)
@@ -95,7 +95,6 @@ def train(task_ids, model, first_task,to_freeze):
 
     train_qadata = QADataset(train_dataset, "train", SPECIAL_TOKEN_IDS[tasks[0]], train_extra_data)
     max_train_batch_size = max(len(train_qadata) // args.min_n_steps, args.min_batch_size)
-#     max_train_batch_size = 1
     train_dataloader = create_dataloader(train_qadata, "train", max_train_batch_size)
     if not args.unbound and args.seq_train_type != "multitask":
         #n_train_epochs = TASK_DICT[tasks[0]]["n_train_epochs"]
@@ -108,11 +107,20 @@ def train(task_ids, model, first_task,to_freeze):
 
     param_optimizer = list(model.named_parameters())
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
-
+#     layer_to_freeze = random.randrange(0,12)
+    layer_to_freeze = args.layer_to_freeze
+    logger.info('layer froze : {}'.format(layer_to_freeze))
+#     if task_ids[0] == 1:
     optimizer_grouped_parameters = [
-        {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
-        {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-        ]
+        {'params': [p for n, p in param_optimizer if (not any(nd in n for nd in no_decay) and not any(nd in n for nd in ['transformer.h.{}'.format(layer_to_freeze)]))], 'weight_decay': args.weight_decay},
+        {'params': [p for n, p in param_optimizer if (any(nd in n for nd in no_decay) and not any(nd in n for nd in ['transformer.h.{}'.format(layer_to_freeze)]))], 'weight_decay': 0.0},
+        {'params': [p for n, p in param_optimizer if any(nd in n for nd in ['transformer.h.{}'.format(layer_to_freeze)])], 'lr':0},
+    ]
+#     else:
+#         optimizer_grouped_parameters = [
+#             {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
+#             {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+#             ]
         
     if "gem" in args.seq_train_type:
         model.task_id = task_ids[0]
@@ -202,16 +210,32 @@ if __name__ == '__main__':
     init_logging(os.path.join(args.model_dir_root, 'log_train.txt'))
     logger.info('args = {}'.format(str(args)))
 
+#     task_load = 'boolq'
+#     model_dir = '/workdir/Desktop/lifelong_learning/lamol_output_task2/gpt2/lll/boolq_movie_scifact_0.2/boolq'
+#     model_path = os.path.join(model_dir, 'model-5')
+#     config_path = os.path.join(model_dir,CONFIG_NAME)
+
+#     gen_token = get_gen_token(task_load)
+#     TOKENIZER.add_tokens([gen_token])
+#     SPECIAL_TOKENS[task_load] = gen_token
+#     SPECIAL_TOKEN_IDS[task_load] = TOKENIZER.convert_tokens_to_ids(gen_token)
+#     model_config = CONFIG_CLASS.from_json_file(config_path) 
+#     model = MODEL_CLASS(model_config).cuda().eval()
+#     state_dict = torch.load(model_path, map_location='cuda:3')
+#     model.load_state_dict(state_dict)
     model = None
+    global TOKENS_WEIGHT
+    if len(TOKENIZER) != TOKENS_WEIGHT.shape[0]:
+        TOKENS_WEIGHT = torch.cat((TOKENS_WEIGHT, torch.ones([1]).cuda()))
+
     if args.seq_train_type == "multitask":
         model = train(list(range(len(args.tasks))), model)
     else:
         if args.unbound:
             TASK_DICT = lll_unbound_setting(split_size=args.unbound)
         first_task = True
-        to_freeze = ((2,[0,2,3,4,5,7,8,9,11]),(3,[2,3,8]))
         for task_id in range(len(args.tasks)):
 #             model = train([task_id], model)
-            model = train([task_id], model,first_task,to_freeze)
+            model = train([task_id], model,first_task)
 
             first_task = False

@@ -27,13 +27,17 @@ def train(task_ids, model, first_task,to_freeze):
     logger.info("start to train { task: %s, seq train type: %s }" % (tasks, args.seq_train_type))
     model_dir = get_model_dir(tasks)
     make_dir(model_dir)
+    
+    logger.info(f"tasks: {tasks}")
 
     train_dataset = [TASK_DICT[t]["train"] for t in tasks]
     train_extra_data = []
     if "lll" in args.seq_train_type and task_ids[0] > 0 and not args.skip_tasks:
         prev_task = args.tasks[task_ids[0]-1]
         with torch.no_grad():
-            create_extra_data(tasks[0], prev_task, model, train_extra_data)
+            logger.info(f"create_extra_data ( current_task: {tasks[0]}, prev_task: {prev_task} )")
+            # Knight changed to create_extra_data2
+            create_extra_data2(tasks[0], prev_task, model, train_extra_data)
     elif "gem" in args.seq_train_type and task_ids[0] > 0: 
         get_real_data(tasks[0], train_extra_data, accum=False, encode=True)
         args.memory_data.append(train_extra_data)

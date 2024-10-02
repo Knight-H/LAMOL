@@ -1,4 +1,5 @@
 import torch
+from pytorch_transformers.modeling_utils import Conv1D
 from torch.utils.data import Dataset, DataLoader, Sampler
 import torch.nn.functional as F
 import re
@@ -20,9 +21,35 @@ import sys
 import time
 import quadprog
 import io
+from tqdm import tqdm
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="UTF-8")
 logger = logging.getLogger(__name__)
 
+# Knight added allowed tokens
+ALLOWED_TOKENS = {
+    "movie" : ["NEG", "POS"],
+    "boolq": ["True", "False"],
+    "scifact": ["REFUTES", "SUPPORTS"]
+}
+
+def freeze_attention_head(layer, head_indices, bias_indices=None):
+    if bias_indices is None:
+        bias_indices = head_indices
+
+    def freezing_hook_full(layer, grad_input, grad_output, weight_multiplier, bias_multiplier):
+        return (grad_input[0] * weight_multiplier,)
+
+    weight_multiplier = torch.ones(layer.weight.shape[1]).half().to(layer.weight.device)
+    for head in head_indices:
+        weight_multiplier[head*64:(head+1)*64] = 0
+        weight_multiplier[head*64+768:(head+1)*64+768] = 0
+        weight_multiplier[head*64+(768*2):(head+1)*64+(768*2)] = 0
+#     weight_multiplier = weight_multiplier.view(1, -1)
+    bias_multiplier = torch.ones(layer.weight.shape[1]).half().to(layer.weight.device)
+    bias_multiplier[bias_indices] = 0
+    freezing_hook = lambda layer, grad_input, grad_output: freezing_hook_full(layer, grad_input, grad_output, weight_multiplier, bias_multiplier)
+
+    layer.register_backward_hook(freezing_hook)
 
 def make_dir(d):
     pathlib.Path(d).mkdir(parents=True, exist_ok=True)
@@ -60,6 +87,25 @@ def pad_all_to_max_len(ls, val):
     max_len = max(len(l) for l in ls)
     return [pad_to_max_len(l, max_len-len(l), val) for l in ls]
 
+def top_k_top_p_with_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf'), filtered_tokens = []):
+    """ Filter a distribution of logits using top-k and/or nucleus (top-p) filtering
+        Args:
+            logits: logits distribution shape (vocabulary size)
+            top_k > 0: keep only top k tokens with highest probability (top-k filtering).
+            top_p > 0.0: keep the top tokens with cumulative probability >= top_p (nucleus filtering).
+                Nucleus filtering is described in Holtzman et al. (http://arxiv.org/abs/1904.09751)
+            filtered_tokens: token ids in a list to filter out
+        From: https://gist.github.com/thomwolf/1a5a29f6962089e871b94cbd09daf317
+    """
+    # assert logits.dim() == 1  # batch size 1 for now - could be updated for more but the code would be less clear
+    # Filter all tokens out with filter value
+    logits[..., filtered_tokens] = filter_value
+    top_k = min(top_k, logits.size(-1))  # Safety check
+    if top_k > 0:
+        # Remove all tokens with a probability less than the last token of the top-k
+        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        logits[indices_to_remove] = filter_value
+    return logits
 
 def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
     """ Filter a distribution of logits using top-k and/or nucleus (top-p) filtering
@@ -574,6 +620,224 @@ def sample_sequence(model, need_process, qa_results, all_pasts, max_tot_lens):
         for idx in remove_ids:
             remove_id(idx, need_process, all_pasts)
 
+            
+# Knight added sample_sequence2 for post processing 
+def sample_sequence2(model, need_process, qa_results, all_pasts, max_tot_lens, trash_batch_ids, task_names):
+    
+    COMMON_TOKEN_FILTER = [SPECIAL_TOKEN_IDS[task_name] for task_name in task_names]
+    map_special2task = {SPECIAL_TOKEN_IDS[task_name]:task_name for task_name in task_names}
+    
+    # Don't stop until all the need_process ids are deleted
+    while len(need_process) > 0:
+        
+        # The first id of the need_process to do
+        first_id = next(iter(need_process))
+        # qa_results a torch tensor with a single value of the task_name token, so shortest_len would start with 1
+        shortest_len = len(qa_results[first_id])
+        decode_batch_size = int(args.memory_sizes[0] * MEMORY_FACTOR[args.seq_train_type] // (shortest_len+1)**LEN_FACTOR)
+        it = iter(need_process) # Iterator of all the batch_ids needed to generate
+        stop = False
+        remove_ids = []
+        
+#         logger.info(f"first_id: {first_id}")
+#         logger.info(f"shortest_len: {shortest_len}")
+#         logger.info(f"decode_batch_size: {decode_batch_size}")
+        
+        while not stop:
+            batch_ids, input_ids, past = [], [], [[] for _ in range(MODEL_CONFIG.n_layer)]
+            while True:
+                try:
+                    cur_id = next(it)
+                    if len(qa_results[cur_id]) > shortest_len:
+#                         logger.info("len(qa_results[cur_id]) > shortest_len, Making Stop True and breaking out")
+                        stop = True
+                        break
+                    batch_ids.append(cur_id)
+                    if args.model_name == "gpt2":
+                        # if gpt2, input_ids only puts in the **last token** of the batch_id
+                        input_ids.append(qa_results[cur_id][-1:]) 
+                        for layer_id in range(MODEL_CONFIG.n_layer):
+                            past[layer_id].append(all_pasts[layer_id][cur_id])
+                    else:
+                        input_ids.append(qa_results[cur_id])
+                    if len(input_ids) == decode_batch_size:
+#                         logger.info("len(input_ids) == decode_batch_size, Making Stop True and Breaking out without stop True")
+                        break
+                except StopIteration:
+#                     logger.info("Stopping iteration, Making Stop True and breaking out")
+                    stop = True
+                    break
+            
+            n_inputs = len(input_ids)
+            if n_inputs == 0:
+                break
+            input_ids = torch.stack(input_ids)
+            
+#             logger.info(f"stop: {stop}")
+#             logger.info(f"batch_ids: {batch_ids}")
+#             logger.info(f"len(input_ids): {len(input_ids)}, input_ids: {input_ids[:5]}")
+#             logger.info(f"len(past) {len(past)} , past: {past[0][0]}") TOO LONG!!!
+#             raise Exception("BREAKPOINT")
+            
+            if args.model_name == "gpt2":
+                for layer_id in range(MODEL_CONFIG.n_layer):
+                    past[layer_id] = torch.stack(past[layer_id], dim=1)
+                all_outputs = model(input_ids=input_ids.cuda(), past=past)
+            else:
+                all_outputs = model(input_ids=input_ids.cuda())
+
+            outputs = all_outputs[0]
+            if args.model_name == "gpt2":
+                pasts = all_outputs[1]  # Tuple of 12 n_layers, each with size [2, 320, 12, 1, 64]
+            # Looks like past_key_values  each tensor of shape (2, batch_size, num_heads, sequence_length, embed_size_per_head)
+            # https://huggingface.co/transformers/model_doc/gpt2.html
+
+            next_logits = outputs[..., -1, :] / args.temperature_qa  # The output of the model, size [batch_size, vocab] ie. [320, 50261]
+            next_tokens = logits_to_tokens_filter(next_logits, filtered_tokens=COMMON_TOKEN_FILTER).cpu()        # The output of the selected token ID [batch_size, 1] ie. [320, 1]
+            
+#             logger.info(f"next_logits: {next_logits.shape}")
+#             logger.info(f"next_tokens: {next_tokens.shape}, {next_tokens[:5]}")
+    
+
+            for i, cur_id in enumerate(batch_ids):
+                # get the first token of the current ID -> map __gen__ to task name
+                current_task_name = map_special2task[qa_results[cur_id][0].item()] 
+                # get the corresponding allowed tokens on that particular task
+                current_task_allowed_tokens = ALLOWED_TOKENS[current_task_name]
+                # encode the tokens (they will be sub-strings in the datatype list)
+                current_task_allowed_token_ids = [TOKENIZER.encode(token) for token in current_task_allowed_tokens]
+                
+
+            
+                if next_tokens[i] == SPECIAL_TOKEN_IDS["eos_token"]:
+                    
+                    ### Knight Added Filters ###
+                    # Filter 1: Length: If length < 20 tokens, not allow this to be eos_token!
+                    if len(qa_results[cur_id]) < 20:
+                        # Resize to make next_logits[i] batch 1, to use existing logits_to_tokens method
+                        next_tokens[i] = logits_to_tokens_filter(next_logits[i].view(1, -1), filtered_tokens=COMMON_TOKEN_FILTER+[SPECIAL_TOKEN_IDS["eos_token"]]).cpu()[0]
+                        
+                        ## COMMON CONCAT AND CHECK ##
+                        qa_results[cur_id] = torch.cat((qa_results[cur_id], next_tokens[i]))
+                        if args.model_name == "gpt2":
+                            for layer_id in range(MODEL_CONFIG.n_layer):
+                                all_pasts[layer_id][cur_id] = pasts[layer_id][:, i].type(torch.float if args.fp32 else torch.half)
+                        ## END COMMON CONCAT AND CHECK ##
+                        
+                        
+                    # Filter 2: ALLOWED Answer Tokens: 
+                    #      - If Last token is in allowed answers, change second last to __ans__ and done
+                    # If Any of the allowed tokens are equal to the last qa_results[cur_id]!!
+                    elif np.any([np.array_equal(qa_results[cur_id][-len(allowed_tokens):].tolist() ,allowed_tokens) 
+                                 for allowed_tokens in current_task_allowed_token_ids]):
+#                         print(f"Found Answer! Amazing. {TOKENIZER.decode(qa_results[cur_id][-20:].tolist())}")
+                        # Get the index of the Answer
+                        answer_index = np.where([np.array_equal(qa_results[cur_id][-len(allowed_tokens):].tolist() ,allowed_tokens) 
+                                 for allowed_tokens in current_task_allowed_token_ids])[0][0]
+                        # Change the token before to __ans__
+                        qa_results[cur_id][-len(current_task_allowed_token_ids[answer_index])-1] = SPECIAL_TOKEN_IDS["ans_token"]
+                        remove_ids.append(cur_id)
+                        trash_batch_ids.discard(cur_id)
+                        
+                    #      - If Last token is not in the allowed answers, 
+                    #      Filter 3: __ans__ token: If there exists any __ans__ token in the last 10 tokens
+                    #               - If second last token is __ans__ : softmax the logits for the allowed tokens
+                    #               - If second last token is NOT __ans__ : do it again
+                    elif SPECIAL_TOKEN_IDS["ans_token"] in qa_results[cur_id][-10:].tolist():
+                        # Check if __ans__ is not at the absolute end!
+                        # IF it is, do it again!
+                        ans_id = np.where(np.array(qa_results[cur_id].tolist()) == SPECIAL_TOKEN_IDS["ans_token"])[0][-1] #the last __ans__
+                        if len(qa_results[cur_id][:ans_id+1]) + max([len(tokens) for tokens in current_task_allowed_token_ids]) > max_tot_lens[cur_id]:
+                            trash_batch_ids.add(cur_id) 
+                            remove_ids.append(cur_id)
+                        # softmax the logits for the allowed tokens
+                        else:
+                            filtered_logits = next_logits[i][[tokens[0] for tokens in  current_task_allowed_token_ids]]
+                            # If any of it is infinity, just random
+                            if torch.any(torch.isinf(filtered_logits)).item():
+                                current_answer = np.random.choice(current_task_allowed_token_ids)
+                            else:
+                                answer_index = np.argmax(filtered_logits.tolist())
+                                current_answer = current_task_allowed_token_ids[answer_index]
+                            # Concat and END! 
+                            qa_results[cur_id] = torch.cat((qa_results[cur_id][:ans_id+1], torch.Tensor(current_answer).type(torch.long)))
+                            remove_ids.append(cur_id)
+                            trash_batch_ids.discard(cur_id)
+
+                        ## Reset it to only the first token (task token)
+#                         qa_results[cur_id] = qa_results[cur_id][:1] 
+#                         if args.model_name == "gpt2":
+#                             for layer_id in range(MODEL_CONFIG.n_layer):
+#                                 # Copy from the initialization in create_extra_data CANT??? -> because of torch.stack
+#                                 all_pasts[layer_id][cur_id] = torch.empty(2, MODEL_CONFIG.n_head, 0,
+#                                                                           MODEL_CONFIG.n_embd//MODEL_CONFIG.n_head,
+#                                                                           dtype=torch.float if args.fp32 else torch.half).cuda()
+#                                 all_pasts[layer_id][cur_id] = pasts[layer_id][:, i].type(torch.float if args.fp32 else torch.half)
+
+                    
+                    ### END Knight Added Filters ###
+                    # Lol. Nothing is good. Do again.
+                    else:
+                        trash_batch_ids.add(cur_id) 
+                        remove_ids.append(cur_id)
+                    
+                else:
+                    ## COMMON CONCAT AND CHECK ##
+                    qa_results[cur_id] = torch.cat((qa_results[cur_id], next_tokens[i]))
+                    # If now at max length:
+                    if len(qa_results[cur_id]) in [max_tot_lens[cur_id], args.max_len]:
+                        ### Knight Added Filters ###
+                        # Filter 2: ALLOWED Answer Tokens: 
+                        #      - If Last token is in allowed answers, change second last to __ans__ and done
+                        if np.any([np.array_equal(qa_results[cur_id][-len(allowed_tokens):].tolist() ,allowed_tokens) 
+                                 for allowed_tokens in current_task_allowed_token_ids]):
+#                             print(f"Found Answer! Amazing. {TOKENIZER.decode(qa_results[cur_id][-20:].tolist())}")
+                            # Get the index of the Answer
+                            answer_index = np.where([np.array_equal(qa_results[cur_id][-len(allowed_tokens):].tolist() ,allowed_tokens) 
+                                     for allowed_tokens in current_task_allowed_token_ids])[0][0]
+                            # Change the token before to __ans__
+                            qa_results[cur_id][-len(current_task_allowed_token_ids[answer_index])-1] = SPECIAL_TOKEN_IDS["ans_token"]
+                            remove_ids.append(cur_id)
+                            trash_batch_ids.discard(cur_id)
+                        #      - If Last token is not in the allowed answers, 
+                        #      Filter 3: __ans__ token: If there exists any __ans__ token in the last 10 tokens
+                        #               - If second last token is __ans__ : softmax the logits for the allowed tokens
+                        #               - If second last token is NOT __ans__ : do it again
+                        elif SPECIAL_TOKEN_IDS["ans_token"] in qa_results[cur_id][-10:].tolist():
+                            # Check if __ans__ is not at the absolute end!
+                            # IF it is, do it again!
+                            ans_id = np.where(np.array(qa_results[cur_id].tolist()) == SPECIAL_TOKEN_IDS["ans_token"])[0][-1] #the last __ans__
+                            if len(qa_results[cur_id][:ans_id+1]) + max([len(tokens) for tokens in current_task_allowed_token_ids]) > max_tot_lens[cur_id]:
+                                trash_batch_ids.add(cur_id) 
+                                remove_ids.append(cur_id)
+                            # softmax the logits for the allowed tokens
+                            else:
+                                filtered_logits = next_logits[i][[tokens[0] for tokens in  current_task_allowed_token_ids]]
+                                # If any of it is infinity, just random
+                                if torch.any(torch.isinf(filtered_logits)).item():
+                                    current_answer = np.random.choice(current_task_allowed_token_ids)
+                                else:
+                                    answer_index = np.argmax(filtered_logits.tolist())
+                                    current_answer = current_task_allowed_token_ids[answer_index]
+                                # Concat and END! 
+                                qa_results[cur_id] = torch.cat((qa_results[cur_id][:ans_id+1], torch.Tensor(current_answer).type(torch.long)))
+                                remove_ids.append(cur_id)
+                                trash_batch_ids.discard(cur_id)
+                        ### END Knight Added Filters ###
+                        # Lol. Nothing is good. Do again.
+                        else:
+                            trash_batch_ids.add(cur_id) 
+                            remove_ids.append(cur_id)
+                    elif args.model_name == "gpt2":
+                        for layer_id in range(MODEL_CONFIG.n_layer):
+                            all_pasts[layer_id][cur_id] = pasts[layer_id][:, i].type(torch.float if args.fp32 else torch.half)
+                    ## END COMMON CONCAT AND CHECK ##
+                            
+#             logger.info(f"qa_results: {qa_results[:5]}")
+#             logger.info(f"remove_ids: {remove_ids}")
+            
+        for idx in remove_ids:
+            remove_id(idx, need_process, all_pasts)
 
 def write_extra_data(dump_path, qa_results):
     logger.info(f"writing extra data in {dump_path} ...")
@@ -649,7 +913,7 @@ def create_extra_data(task, prev_task, model, train_extra_data):
         gen_size = task_cnt
 
     model.eval()
-
+    logger.info(f"generating extra data!")
     need_process = OrderedDict()
     qa_results = []
     for task_name in args.tasks[:task_cnt]:
@@ -675,7 +939,115 @@ def create_extra_data(task, prev_task, model, train_extra_data):
 
     write_extra_data(gen_path, qa_results)
 
+    
+## Knight added create_extra_data that uses sample_sequence2
+def create_extra_data2(task, prev_task, model, train_extra_data):
+    if args.real_sample:
+        logger.info(f"using real data as extra data")
+        return get_real_data(task, train_extra_data)
+    task_cnt = args.tasks.index(task)
+    model_dir = get_model_dir([prev_task])
+    gen_path = os.path.join(model_dir,"lm.csv")
+    if os.path.exists(gen_path):
+        logger.info(f"extra data exists in {gen_path}, read it!")
+        return read_extra_data(gen_path, train_extra_data) 
+    gen_size = DATA_ATTRS[task]["train"]["data_size"]
+    gen_size = int(np.ceil(gen_size * args.gen_lm_sample_percentage))
+    gen_size -= (gen_size % task_cnt)
+    
+    logger.info(f"This is arg tasks {args.tasks}, Current Task is {task}, task_cnt {task_cnt}")
+    logger.info(f"This is model_dir {model_dir}")
+    logger.info(f"This is gen_path {gen_path}")
+    logger.info(f"This is gen_size {gen_size}")
 
+    if args.debug:
+        gen_size = task_cnt
+
+    model.eval()
+    logger.info(f"generating extra data!")
+    need_process = OrderedDict()
+    
+    # For an array of task_name's up to the task_cnt, make qa_results a single value of the __task__ token with the size gen_size//task_cnt
+    # This means that all tasks will have equal portions of gen_size ie. [ tensor(__boolq__) , .... , tensor(__movies__), ... ]
+    qa_results = []
+    for task_name in args.tasks[:task_cnt]:
+        qa_results.extend([torch.tensor([SPECIAL_TOKEN_IDS[task_name]]) for _ in range(gen_size//task_cnt)])
+    logger.info(f"This is len(qa_results) {len(qa_results)}, qa_results: {qa_results[:5]}")
+    
+    # Initialize empty tensors for gensize , n_layers ?
+    all_pasts = [[
+        torch.empty(2, MODEL_CONFIG.n_head, 0, MODEL_CONFIG.n_embd//MODEL_CONFIG.n_head,
+            dtype=torch.float if args.fp32 else torch.half).cuda()
+        for _ in range(gen_size)
+    ] for __ in range(MODEL_CONFIG.n_layer)]
+    
+    # a list of max_len in the range of gen_size ie. [ 1024, 1024, ...] 
+    max_tot_lens = [args.max_len for _ in range(gen_size)]
+    logger.info(f"This is len(max_tot_lens) {len(max_tot_lens)}, max_tot_lens: {max_tot_lens[:5]}")
+
+    # Knight added SET of trash_batch_ids
+    trash_batch_ids = set()
+    
+    logger.info(f"Now iterating over all samples while checking if len(need_process) > {int(args.memory_sizes[0] * 0.12)}")
+    # For every sample in the gen_size, update the OrderedDict need_process with the batch ID
+    for i in range(gen_size):
+        need_process.update([[i, None]])
+        # If the Need_process is more than the memory_size, sample the sequence now
+        if len(need_process) > int(args.memory_sizes[0] * 0.12):
+            print(f"need process len {len(need_process)} exceeds mem size {int(args.memory_sizes[0] * 0.12)} ! Sample Sequence Now")
+            sample_sequence2(model, need_process, qa_results, all_pasts, max_tot_lens, trash_batch_ids, args.tasks[:task_cnt])
+    sample_sequence2(model, need_process, qa_results, all_pasts, max_tot_lens, trash_batch_ids, args.tasks[:task_cnt])
+    
+    # Maximum Loop Iterations, else it will take forever to run if the LM is not good!!
+    TOLERANCE_LOOP_ITERATIONS = 15
+    loop_counter = 0 
+    while len(trash_batch_ids) > 0 and loop_counter < TOLERANCE_LOOP_ITERATIONS:
+        print(f"At the Trash Loop Counter: {loop_counter}, check if < {TOLERANCE_LOOP_ITERATIONS}")
+        print(f"I HAVE THIS MUCH TRASH {trash_batch_ids} Total of {len(trash_batch_ids)}")
+        need_process = OrderedDict()
+        for i in trash_batch_ids:
+            # Clear all qa_results and pasts
+            qa_results[i] = qa_results[i][:1] # Reset it to only the first token (task token)
+            # Copy from the initialization in create_extra_data 
+            for layer_id in range(MODEL_CONFIG.n_layer):        
+                all_pasts[layer_id][i] = torch.empty(2, MODEL_CONFIG.n_head, 0,
+                                                  MODEL_CONFIG.n_embd//MODEL_CONFIG.n_head,
+                                                  dtype=torch.float if args.fp32 else torch.half).cuda()
+            
+            need_process.update([[i, None]])
+            if len(need_process) > int(args.memory_sizes[0] * 0.12):
+                print(f"need process len {len(need_process)} exceeds mem size {int(args.memory_sizes[0] * 0.12)} ! Sample Sequence Now")
+                sample_sequence2(model, need_process, qa_results, all_pasts, max_tot_lens, trash_batch_ids, args.tasks[:task_cnt])
+        sample_sequence2(model, need_process, qa_results, all_pasts, max_tot_lens, trash_batch_ids, args.tasks[:task_cnt])
+        loop_counter += 1 
+        
+    # LET"S JUST TRY TO DO EACH SAMPLE SINCE IT"S SO BURDEN TO WORK WITH PAST_KEY Stack if the dimensions are DIFFERENT!!!
+    # SHOULD BE INEFFICIENT AS HELL BUT IT WORKS?
+#     for i in tqdm(range(gen_size)):
+#         need_process.update([[i, None]])
+#         sample_sequence2(model, need_process, qa_results, all_pasts, max_tot_lens)
+#         logger.info(f"ID: {i} {TOKENIZER.decode(qa_results[i].tolist())}")
+#         if i%10 == 0:
+#             logger.info(f"qa_results")
+#             for ii in range(i, i+6):
+#                 logger.info(f"ID: {ii} {TOKENIZER.decode(qa_results[ii].tolist())}")
+
+    model.train()
+
+    qa_results = [res.tolist() for res in qa_results]
+    train_extra_data.extend(qa_results)
+    qa_results = [TOKENIZER.decode(res) for res in qa_results]
+    
+    # Write qa_results as csv, all in gen_path
+    write_extra_data(gen_path, qa_results)
+
+# Knight added with filtering
+def logits_to_tokens_filter(next_logits, filtered_tokens=[]):
+    filtered_logits = top_k_top_p_with_filtering(next_logits, top_k=args.top_k_qa, top_p=args.top_p_qa, filtered_tokens=filtered_tokens)
+    log_probs = F.softmax(filtered_logits, dim=-1)
+    next_tokens = torch.multinomial(log_probs, num_samples=1)
+    return next_tokens
+    
 def logits_to_tokens(next_logits):
     filtered_logits = top_k_top_p_filtering(next_logits, top_k=args.top_k_qa, top_p=args.top_p_qa)
     log_probs = F.softmax(filtered_logits, dim=-1)

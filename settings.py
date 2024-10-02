@@ -74,6 +74,7 @@ def parse_args():
     parser.add_argument("--train_batch_size", type=int, default=0)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--qp_margin", type=float, default=0.5)
+    parser.add_argument("--layer_to_freeze", type=int, default=0)
     args = parser.parse_args()
 
     if args.debug:
@@ -85,7 +86,7 @@ def parse_args():
             args.seq_train_type, "{}_{}".format("_".join(args.tasks),
                 args.gen_lm_sample_percentage) if "lll" in args.seq_train_type else "_".join(args.tasks))
 
-    args.device_ids = GPUtil.getAvailable(maxLoad=0.05, maxMemory=0.05, limit=args.n_gpus)
+    args.device_ids = GPUtil.getAvailable(maxLoad=0.1, maxMemory=0.05, limit=args.n_gpus)
     if len(args.device_ids) == 0:
         logger.error('No available GPUs!')
         raise NotImplementedError("No CPU mode available!")
@@ -94,8 +95,11 @@ def parse_args():
         logger.warning('Available number of GPU = {} < n_gpus = {}'.format(len(args.device_ids), args.n_gpus))
         args.n_gpus = len(args.device_ids)
         logger.warning('Continue training with {} GPUs'.format(args.n_gpus))
-
-    torch.cuda.set_device(args.device_ids[0])
+    
+#     print("THIS IS GPU DEVICE IDS")
+#     print(args.device_ids[0])
+#     torch.cuda.set_device(args.device_ids[0])
+    torch.cuda.set_device("cuda:1") #KNIGHT FIX CUDA GPU
 
     gpus = GPUtil.getGPUs()
     gpu_names = [gpus[device_id].name for device_id in args.device_ids]
@@ -280,4 +284,34 @@ TASK_DICT = {
                "test":os.path.join(args.data_dir,"yelp_to_squad-test-v2.0.json"),
                "n_train_epochs": args.n_train_epochs 
     },
+    "task1": {
+               "train":os.path.join(args.data_dir,"task1_train.json"),
+               "eval":os.path.join(args.data_dir,"task1_dev.json"),
+               "test":os.path.join(args.data_dir,"task1_test.json"),
+               "n_train_epochs": args.n_train_epochs 
+    },
+    "task2": {
+               "train":os.path.join(args.data_dir,"task2_train.json"),
+               "eval":os.path.join(args.data_dir,"task2_dev.json"),
+               "test":os.path.join(args.data_dir,"task2_test.json"),
+               "n_train_epochs": args.n_train_epochs 
+    },
+    "movie": {
+               "train":os.path.join(args.data_dir,"movie_train.json"),
+               "eval":os.path.join(args.data_dir,"movie_dev.json"),
+               "test":os.path.join(args.data_dir,"movie_test.json"),
+               "n_train_epochs": args.n_train_epochs 
+    },
+    "boolq": {
+               "train":os.path.join(args.data_dir,"boolq_train.json"),
+               "eval":os.path.join(args.data_dir,"boolq_dev.json"),
+               "test":os.path.join(args.data_dir,"boolq_test.json"),
+               "n_train_epochs": args.n_train_epochs 
+    },
+    "scifact": {
+               "train":os.path.join(args.data_dir,"scifact_train.json"),
+               "eval":os.path.join(args.data_dir,"scifact_dev.json"),
+               "test":os.path.join(args.data_dir,"scifact_test.json"),
+               "n_train_epochs": args.n_train_epochs 
+    }
 }

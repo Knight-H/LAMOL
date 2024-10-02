@@ -25,12 +25,12 @@ def train(task_ids, model, first_task,to_freeze):
     tasks = [args.tasks[task_id] for task_id in task_ids]
 
     logger.info("start to train { task: %s, seq train type: %s }" % (tasks, args.seq_train_type))
-    model_dir = get_model_dir(tasks)
+    model_dir = get_model_dir(tasks) 
     make_dir(model_dir)
 
     train_dataset = [TASK_DICT[t]["train"] for t in tasks]
     train_extra_data = []
-    if "lll" in args.seq_train_type and task_ids[0] > 0 and not args.skip_tasks:
+    if "lll" in args.seq_train_type and not args.skip_tasks:
         prev_task = args.tasks[task_ids[0]-1]
         with torch.no_grad():
             create_extra_data(tasks[0], prev_task, model, train_extra_data)
@@ -40,12 +40,12 @@ def train(task_ids, model, first_task,to_freeze):
         train_extra_data = []
     logger.info('extra training data size: {}'.format(len(train_extra_data)))
 
-    if not model:
-        # which_model_to_load = model_dir if os.path.isfile(os.path.join(model_dir, FINAL_SAVE_NAME)) else args.model_name
-        model = MODEL_CLASS.from_pretrained(args.model_name).cuda()
-        model.resize_token_embeddings(len(TOKENIZER))
-        if not args.fp32:
-            model = FP16_Module(model)
+#     if not model:
+#         # which_model_to_load = model_dir if os.path.isfile(os.path.join(model_dir, FINAL_SAVE_NAME)) else args.model_name
+#         model = MODEL_CLASS.from_pretrained(args.model_name).cuda()
+#         model.resize_token_embeddings(len(TOKENIZER))
+#         if not args.fp32:
+#             model = FP16_Module(model)
 
     gen_token = get_gen_token(tasks[0])
     TOKENIZER.add_tokens([gen_token])
@@ -202,15 +202,31 @@ if __name__ == '__main__':
     init_logging(os.path.join(args.model_dir_root, 'log_train.txt'))
     logger.info('args = {}'.format(str(args)))
 
-    model = None
+    task_load = 'boolq'
+    model_dir = '/root/eraserbenchmark/bsm_task12/task1'
+    model_path = os.path.join(model_dir, 'model-5')
+    config_path = os.path.join(model_dir,CONFIG_NAME)
+
+    gen_token = get_gen_token(task_load)
+    TOKENIZER.add_tokens([gen_token])
+    SPECIAL_TOKENS[task_load] = gen_token
+    SPECIAL_TOKEN_IDS[task_load] = TOKENIZER.convert_tokens_to_ids(gen_token)
+    model_config = CONFIG_CLASS.from_json_file(config_path) 
+    model = MODEL_CLASS(model_config).cuda().eval()
+    state_dict = torch.load(model_path, map_location='cuda:1')
+    model.load_state_dict(state_dict)
+    global TOKENS_WEIGHT
+    if len(TOKENIZER) != TOKENS_WEIGHT.shape[0]:
+        TOKENS_WEIGHT = torch.cat((TOKENS_WEIGHT, torch.ones([1]).cuda()))
+
     if args.seq_train_type == "multitask":
         model = train(list(range(len(args.tasks))), model)
-    else:
-        if args.unbound:
+    else: #lll
+        if args.unbound: # dont see this using?
             TASK_DICT = lll_unbound_setting(split_size=args.unbound)
         first_task = True
         to_freeze = ((2,[0,2,3,4,5,7,8,9,11]),(3,[2,3,8]))
-        for task_id in range(len(args.tasks)):
+        for task_id in range(len(args.tasks)): # 0 , 1 ,2 
 #             model = train([task_id], model)
             model = train([task_id], model,first_task,to_freeze)
 
